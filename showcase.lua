@@ -1,11 +1,10 @@
--- Services
 local Players = game:GetService("Players")
 local DataStoreService = game:GetService("DataStoreService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-
 local PlayerDataStore = DataStoreService:GetDataStore("PlayerData_v3")
 
+-- ClickPower starts at 1 so new players still earn something per click
+-- AutoClickSpeed at 0 means no passive income until they buy it
 local DATA_TEMPLATE = {
 	Clicks = 0,
 	TotalClicks = 0,
@@ -21,7 +20,7 @@ local DATA_TEMPLATE = {
 		VFXEnabled = true,
 	},
 }
--- Balancing Settings
+
 local UPGRADE_CONFIG = {
 	ClickPower = {
 		BaseCost = 50,
@@ -47,23 +46,25 @@ local REBIRTH_CONFIG = {
 	GemScaling = 1.2,
 }
 
+-- 120s is a safe middle ground, fast enough to not lose much on a crash but slow enough to not throttle the datastore
 local AUTOSAVE_INTERVAL = 120
 local CLICK_COOLDOWN = 0.05
+-- anything past 25 clicks in a 1 second window is almost certainly an autoclicker
 local MAX_CLICK_BURST = 25
 
 local Remotes = ReplicatedStorage:WaitForChild("Remotes")
 
--- Remotes
 local ClickRemote = Remotes:WaitForChild("ProcessClick")
 local UpgradeRemote = Remotes:WaitForChild("PurchaseUpgrade")
 local RebirthRemote = Remotes:WaitForChild("PerformRebirth")
 local DataSyncRemote = Remotes:WaitForChild("DataSync")
 local SettingsRemote = Remotes:WaitForChild("UpdateSetting")
 
+-- all player data lives here during the session, only touches the datastore on save/load
 local SessionData = {}
+-- tracks timestamps per player so we can detect click spam
 local ClickTimestamps = {}
 
--- Copy data table
 local function DeepCopy(original)
 	if type(original) ~= "table" then
 		return original
@@ -75,7 +76,8 @@ local function DeepCopy(original)
 	end
 	return copy
 end
--- In case new data is added
+
+-- fills in any missing keys so old saves don't break when we add new fields to the template
 local function ReconcileData(saved, template)
 	for key, default in template do
 		if saved[key] == nil then
@@ -85,12 +87,13 @@ local function ReconcileData(saved, template)
 		end
 	end
 end
--- Load Data
+
 local function LoadPlayerData(player: Player)
 	local userId = player.UserId
 	local data = nil
 	local success, err = nil, nil
 
+	-- retry up to 3 times with increasing wait (2s, 4s, 6s) in case of datastore hiccups
 	for attempt = 1, 3 do
 		success, err = pcall(function()
 			data = PlayerDataStore:GetAsync("Player_" .. userId)
@@ -103,6 +106,7 @@ local function LoadPlayerData(player: Player)
 		task.wait(attempt * 2)
 	end
 
+	-- better to kick than let them play with no saving
 	if not success then
 		warn(`Failed to load data for {player.Name}: {err}`)
 		player:Kick("Unable to load your data. Please rejoin.")
@@ -117,7 +121,7 @@ local function LoadPlayerData(player: Player)
 
 	return data
 end
--- Save Data
+
 local function SavePlayerData(player: Player)
 	local userId = player.UserId
 	local data = SessionData[userId]
@@ -135,7 +139,8 @@ local function SavePlayerData(player: Player)
 
 	return success
 end
--- Top Right Leaderstats
+
+-- top right leaderstats
 local function SetupLeaderstats(player: Player, data)
 	local leaderstats = Instance.new("Folder")
 	leaderstats.Name = "leaderstats"
@@ -168,7 +173,8 @@ local function UpdateLeaderstats(player: Player, data)
 	leaderstats.Gems.Value = data.Gems
 	leaderstats.Rebirths.Value = data.Rebirths
 end
--- Update client with server authenticated information
+
+-- sends everything the client UI needs to stay up to date
 local function SyncToClient(player: Player, data)
 	DataSyncRemote:FireClient(player, {
 		Clicks = data.Clicks,
@@ -179,9 +185,10 @@ local function SyncToClient(player: Player, data)
 		Settings = data.Settings,
 	})
 end
--- Calculate scaling
+
 local function GetUpgradeCost(upgradeType: string, currentLevel: number): number
 	local config = UPGRADE_CONFIG[upgradeType]
+	-- anti-exploit
 	if not config then
 		return math.huge
 	end
@@ -201,6 +208,7 @@ local function GetRebirthGemReward(rebirthCount: number): number
 	)
 end
 
+-- 10% per rebirth
 local function CalculateClickValue(data): number
 	local base = data.Upgrades.ClickPower
 	local multiplier = data.Upgrades.Multiplier
@@ -209,6 +217,7 @@ local function CalculateClickValue(data): number
 	return math.floor(base * multiplier * rebirthBonus)
 end
 
+-- sliding window rate limiter, drops timestamps older than 1 second then checks if they've hit the cap
 local function IsClickRateLimited(player: Player): boolean
 	local userId = player.UserId
 	local now = os.clock()
@@ -230,7 +239,7 @@ local function IsClickRateLimited(player: Player): boolean
 	table.insert(timestamps, now)
 	return false
 end
--- Process actions
+
 local function ProcessClick(player: Player)
 	local data = SessionData[player.UserId]
 	if not data then
@@ -292,6 +301,7 @@ local function ProcessRebirth(player: Player): (boolean, string?)
 
 	local gemReward = GetRebirthGemReward(data.Rebirths)
 
+	-- wipe clicks and upgrades back to defaults
 	data.Clicks = 0
 	data.TotalClicks = 0
 	data.Rebirths += 1
@@ -313,6 +323,7 @@ local function ProcessAutoClicks(player: Player, data)
 		return
 	end
 
+	-- 0.5 per level keeps it from outpacing manual clicks too early, rebirth bonus still applies here
 	local clicksPerTick = math.floor(autoLevel * 0.5 * (1 + data.Rebirths * 0.1))
 	if clicksPerTick < 1 then
 		clicksPerTick = 1
@@ -321,7 +332,7 @@ local function ProcessAutoClicks(player: Player, data)
 	data.Clicks += clicksPerTick
 	data.TotalClicks += clicksPerTick
 end
--- Join / Leave Handling
+
 local function OnPlayerAdded(player: Player)
 	local data = LoadPlayerData(player)
 	if not data then
@@ -336,6 +347,7 @@ end
 local function OnPlayerRemoving(player: Player)
 	local userId = player.UserId
 
+	-- nil out their session so it doesn't sit in memory after they leave
 	if SessionData[userId] then
 		SavePlayerData(player)
 		SessionData[userId] = nil
@@ -343,9 +355,10 @@ local function OnPlayerRemoving(player: Player)
 
 	ClickTimestamps[userId] = nil
 end
--- Actions connection
+
 ClickRemote.OnServerEvent:Connect(ProcessClick)
 
+-- don't trust what the client sends, exploiters can pass whatever they want through remotes
 UpgradeRemote.OnServerInvoke = function(player: Player, upgradeType: string)
 	if type(upgradeType) ~= "string" then
 		return false, "InvalidInput"
@@ -372,6 +385,7 @@ SettingsRemote.OnServerInvoke = function(player: Player, settingName: string, va
 		return false
 	end
 
+	-- type check the value against what's already stored
 	if type(value) ~= type(data.Settings[settingName]) then
 		return false
 	end
@@ -383,10 +397,12 @@ end
 Players.PlayerAdded:Connect(OnPlayerAdded)
 Players.PlayerRemoving:Connect(OnPlayerRemoving)
 
+-- catches anyone who joined before this script connected
 for _, player in Players:GetPlayers() do
 	task.spawn(OnPlayerAdded, player)
 end
--- Data Saving on interval and server reset.
+
+-- runs every second, ticking once per second keeps the numbers predictable for balancing
 task.spawn(function()
 	while true do
 		task.wait(1)
@@ -400,6 +416,7 @@ task.spawn(function()
 	end
 end)
 
+-- each save is spawned separately so one player's datastore timeout doesn't hold up the rest
 task.spawn(function()
 	while true do
 		task.wait(AUTOSAVE_INTERVAL)
@@ -412,6 +429,7 @@ task.spawn(function()
 	end
 end)
 
+-- prevents data loss on shutdowns
 game:BindToClose(function()
 	for userId, data in SessionData do
 		local player = Players:GetPlayerByUserId(userId)
